@@ -1,0 +1,313 @@
+#!/usr/bin/perl -w 
+#
+# {ansible managed - do not edit}
+#
+# RGE 7/29/14
+# updated 7/27/16
+#
+# parse apache logs, nginx logs or anything similar and give real-time stats
+# with an eye toward calling out most aggressive requests/requestors
+
+
+use constant VERSION => '0.4';
+
+use Getopt::Long;
+use Time::Local;
+use strict;
+
+my %hIP;
+my %hUserAgent;
+my %hCacheVerb;
+my %hTimeToServe;
+my %hURLByTime;
+my %hRequestsInTimeBlock;
+my %hHitsInTimeBlock;
+my %hFirstTimeByIP;
+my %hLastTimeByIP;
+my %hPerIpPerMinute;
+my $iLines            = 0;
+my $iUnprocessedLines = 0;
+
+my $sApacheTimeREG = '\[(\d{2})\/(\w{3})\/(\d{4}):(\d{2}):(\d{2}):';
+my $sIPAddressREG  = '((?:\d+\.\d+\.\d+\.\d+)|(?:[a-fA-F0-9:]+))';
+my %aMonth         = (Jan => '01', Feb => '02', Mar => '03', Apr => '04', May => '05', Jun => '06', Jul => '07', Aug => '08', Sep => '09', Oct => 10, Nov => 11, Dec => 12);
+
+my $bHelp          = 0;
+my $iWindowMinutes = 10;
+my $bVersion	   = 0;
+
+GetOptions(
+    "w=i" => \$iWindowMinutes,
+    "h|?" => \$bHelp,
+    "v" => \$bVersion
+);
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub insertDomain($$) {
+    my $sGet    = shift;
+    my $sDomain = shift;
+
+    if ($sGet =~ /(GET|POST|HEAD|DELETE|PUT)\s+(.*)/i) {
+        return "$1 $sDomain$2";
+    }
+
+    return $sGet;
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub toWindowTimestamp($$$$$) {
+    my ($iDay, $sMonth, $iYear, $iHour, $iMinute) = @_;
+    return timelocal(0, $iMinute - $iMinute % $iWindowMinutes, $iHour, $iDay, $aMonth{$sMonth} - 1, $iYear - 1900);
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub prct($) {
+    my $iPortion = shift;
+    my $sResult = sprintf("%d", $iPortion / $iLines * 100);
+    return $sResult ? " ($sResult%)" : '     ';
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub quickDNS($) {
+    my $sIP     = shift;
+    my $sResult = '';
+    if (-f '/usr/bin/host' && open(DNS, "/usr/bin/host $sIP |")) {
+        while (<DNS>) {
+            if (/domain name pointer (.*)\./) {
+                $sResult = " ($1)";
+                last;
+            }
+        }
+        close(DNS);
+    }
+
+    return $sResult;
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub updateFirstLast($$$$$$) {
+    my ($sIP, $iYear, $sMonth, $iDay, $iHour, $iMinute) = @_;
+    my $iThisTime = timelocal(0, $iMinute, $iHour, $iDay, $aMonth{$sMonth} - 1, $iYear - 1900);
+
+    unless (defined $hFirstTimeByIP{$sIP} && $hFirstTimeByIP{$sIP} < $iThisTime) {
+	$hFirstTimeByIP{$sIP} = $iThisTime;
+    }
+
+    unless (defined $hLastTimeByIP{$sIP} && $hLastTimeByIP{$sIP} > $iThisTime) {
+	$hLastTimeByIP{$sIP} = $iThisTime;
+    }
+
+    $hPerIpPerMinute{"$sIP;$iThisTime"}++;
+}
+
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# M A I N
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+if ($bVersion) {
+    print "$0 version " . VERSION . "\n";
+    exit;
+}
+
+if ($bHelp || (-t STDIN && !defined $ARGV[0])) {
+    print "$0 [log_file]\n";
+    print "\t-w length of time window block in minutes (default = 10)\n";
+    exit;
+}
+
+
+# 128.210.218.112 - - [29/Aug/2014:12:31:22 -0400] wbaa.org "GET /refresh/listenlive/feed HTTP/1.0" 200 73 "http://wbaa.org/" "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:24.0) Gecko/20100101 Firefox/24.0" X:"128.210.218.112" t:0/301634
+
+# these are expensive regexes to be doing for every line of the log file.  since we have 4 expressions to try
+# it makes sense to save which one matches the first line and then just use that one for every line.
+# $iRegex is the matching regex of the 4.
+my $iRegex = 0;
+
+while (<>) {
+
+    # show we're doing something
+    print STDERR '.' unless (++$iLines % 50000);
+
+    if ($iRegex) {
+        if ($iRegex == 1) {
+            if (/^$sIPAddressREG\s+-\s+(BYPASS|EXPIRED|HIT|MISS|STALE|UPDATING|-)\s+$sApacheTimeREG[^\"]+\"([^\"]*)\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\".*\bt:(\d+)\/\d/) {
+		updateFirstLast($1, $5, $4, $3, $6, $7);
+                my $iTimestamp = toWindowTimestamp($3, $4, $5, $6, $7);
+                $hRequestsInTimeBlock{$iTimestamp}++;
+                $hHitsInTimeBlock{$iTimestamp}++ if ($2 eq 'HIT');
+                $hIP{$1}++;
+                $hCacheVerb{$2}++;
+                $hURLByTime{$10} = $8;
+                $hUserAgent{$9}++;
+                $hTimeToServe{$10}++;
+            }
+    	    else {
+        	++$iUnprocessedLines;
+        	print "UNRECOGNIZED: $_";
+    	    }
+        }
+        elsif ($iRegex == 2) {
+            if (/^$sIPAddressREG\s+-\s+(BYPASS|EXPIRED|HIT|MISS|STALE|UPDATING|-)\s+$sApacheTimeREG[^\"]+\"[^\"]*\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\"/) {
+                $hIP{$1}++;
+                $hCacheVerb{$2}++;
+                $hUserAgent{$8}++;
+		updateFirstLast($1, $5, $4, $3, $6, $7);
+                my $iTimestamp = toWindowTimestamp($3, $4, $5, $6, $7);
+                $hRequestsInTimeBlock{$iTimestamp}++;
+                $hHitsInTimeBlock{$iTimestamp}++ if ($2 eq 'HIT');
+            }
+    	    else {
+        	++$iUnprocessedLines;
+        	print "UNRECOGNIZED: $_";
+    	    }
+        }
+        elsif ($iRegex == 3) {
+            if (/^$sIPAddressREG\s+[^\[]+$sApacheTimeREG[^\]]+\]\s+(\S+)\s+\"([^\"]*)\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\".*\bt:(\d+)\/\d/) {
+                $hIP{$1}++;
+                $hRequestsInTimeBlock{ toWindowTimestamp($2, $3, $4, $5, $6) }++;
+		updateFirstLast($1, $4, $3, $2, $5, $6);
+                $hURLByTime{$10} = insertDomain($8, $7);
+                $hUserAgent{$9}++;
+                $hTimeToServe{$10}++;
+            }
+    	    else {
+        	++$iUnprocessedLines;
+        	print "UNRECOGNIZED: $_";
+    	    }
+        }
+        elsif ($iRegex == 4) {
+            if (/^$sIPAddressREG\s+[^\[]+$sApacheTimeREG[^\"]+\"[^\"]*\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\"/) {
+                $hIP{$1}++;
+                $hRequestsInTimeBlock{ toWindowTimestamp($2, $3, $4, $5, $6) }++;
+		updateFirstLast($1, $4, $3, $2, $5, $6);
+                $hUserAgent{$7}++;
+            }
+    	    else {
+        	++$iUnprocessedLines;
+        	print "UNRECOGNIZED: $_";
+    	    }
+        }
+    }
+    elsif (/^$sIPAddressREG\s+-\s+(BYPASS|EXPIRED|HIT|MISS|STALE|UPDATING|-)\s+$sApacheTimeREG[^\"]+\"([^\"]*)\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\".*\bt:(\d+)\/\d/) {
+        my $iTimestamp = toWindowTimestamp($3, $4, $5, $6, $7);
+	updateFirstLast($1, $5, $4, $3, $6, $7);
+        $hRequestsInTimeBlock{$iTimestamp}++;
+        $hHitsInTimeBlock{$iTimestamp}++ if ($2 eq 'HIT');
+        $hIP{$1}++;
+        $hCacheVerb{$2}++;
+        $hURLByTime{$10} = $8;
+        $hUserAgent{$9}++;
+        $hTimeToServe{$10}++;
+        $iRegex = 1;
+    }
+    elsif (/^$sIPAddressREG\s+-\s+(BYPASS|EXPIRED|HIT|MISS|STALE|UPDATING|-)\s+$sApacheTimeREG[^\"]+\"[^\"]*\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\"/) {
+        $hIP{$1}++;
+        $hCacheVerb{$2}++;
+        $hUserAgent{$8}++;
+        my $iTimestamp = toWindowTimestamp($3, $4, $5, $6, $7);
+	updateFirstLast($1, $5, $4, $3, $6, $7);
+        $hRequestsInTimeBlock{$iTimestamp}++;
+        $hHitsInTimeBlock{$iTimestamp}++ if ($2 eq 'HIT');
+        $iRegex = 2;
+    }
+    elsif (/^$sIPAddressREG\s+[^\[]+$sApacheTimeREG[^\]]+\]\s+(\S+)\s+\"([^\"]*)\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\".*\bt:(\d+)\/\d/) {
+        $hIP{$1}++;
+        $hRequestsInTimeBlock{ toWindowTimestamp($2, $3, $4, $5, $6) }++;
+	updateFirstLast($1, $4, $3, $2, $5, $6);
+        $hURLByTime{$10} = insertDomain($8, $7);
+        $hUserAgent{$9}++;
+        $hTimeToServe{$10}++;
+        $iRegex = 3;
+    }
+    elsif (/^$sIPAddressREG\s+[^\[]+$sApacheTimeREG[^\"]+\"[^\"]*\"[^\"]*\"[^\"]*\"[^\"]*\"([^\"]*)\"/) {
+        $hIP{$1}++;
+	updateFirstLast($1, $4, $3, $2, $5, $6);
+        $hRequestsInTimeBlock{ toWindowTimestamp($2, $3, $4, $5, $6) }++;
+        $hUserAgent{$7}++;
+        $iRegex = 4;
+    }
+    else {
+        ++$iUnprocessedLines;
+        print "UNRECOGNIZED: $_";
+    }
+}
+
+my @aUserAgentKeys = sort {$hUserAgent{$b} <=> $hUserAgent{$a}} keys(%hUserAgent);
+my @aIPKeys        = sort {$hIP{$b} <=> $hIP{$a}} keys(%hIP);
+my @aCacheVerbKeys = sort {$hCacheVerb{$b} <=> $hCacheVerb{$a}} keys(%hCacheVerb);
+my @aTimeBlockKeys = sort {$hRequestsInTimeBlock{$b} <=> $hRequestsInTimeBlock{$a}} keys(%hRequestsInTimeBlock);
+
+print "\rProcessed " . ($iLines - $iUnprocessedLines) . " lines ($iUnprocessedLines unprocessed)\n\n";
+exit if ($iLines == $iUnprocessedLines);
+
+print "By User Agent:\n";
+my $iIndex = 0;
+foreach my $sAgent (@aUserAgentKeys) {
+    print $hUserAgent{$sAgent} . prct($hUserAgent{$sAgent}) . "\t\t$sAgent\n";
+    last if ++$iIndex > 9;
+}
+
+print "\nBy Remote IP:\n";
+$iIndex = 0;
+foreach my $sIP (@aIPKeys) {
+    my $iTimeSpan = 0;
+    if (defined $hFirstTimeByIP{$sIP} && defined $hLastTimeByIP{$sIP}) {
+    	$iTimeSpan = $hLastTimeByIP{$sIP} - $hFirstTimeByIP{$sIP};
+    }
+    print sprintf("%-5d %-4s", $hIP{$sIP}, prct($hIP{$sIP})) . ($iTimeSpan ? sprintf(" %4d/s", int($hIP{$sIP} / $iTimeSpan)) : '') . "\t\t$sIP" . quickDNS($sIP) . "\n";
+    last if ++$iIndex > 9;
+}
+
+print "\nBy IP simultaneous hits:\n";
+$iIndex = 0;
+foreach my $sIP (sort { $hPerIpPerMinute{$b} <=> $hPerIpPerMinute{$a} } keys %hPerIpPerMinute) {
+    if ($hPerIpPerMinute{$sIP} > 35) {
+	if ($sIP =~ /([^;]+);(\d+)/) {
+           print sprintf("%-5d", $hPerIpPerMinute{$sIP}) . " (" . int($hPerIpPerMinute{$sIP} / 60) . "/s)\t" . sprintf("%-15s  ", $1) . localtime($2) . "\n";
+	   last if ++$iIndex > 9;
+	}
+    }
+}
+
+if ($#aCacheVerbKeys >= 0) {
+    print "\nBy Cache Verb:\n";
+    $iIndex = 0;
+    foreach my $sVerb (@aCacheVerbKeys) {
+        print sprintf("%-6s", $hCacheVerb{$sVerb}) . prct($hCacheVerb{$sVerb}) . "\t\t$sVerb\n";
+        last if ++$iIndex > 9;
+    }
+}
+
+if (keys(%hTimeToServe) > 0) {
+    print "\nBy Time to Generate:\n";
+    print "[repeats]\t[seconds - example_url]\n";
+    $iIndex = 0;
+    foreach my $iTime (sort {$b <=> $a} keys %hTimeToServe) {
+        print $hTimeToServe{$iTime} . "\t\t$iTime";
+        if (defined $hURLByTime{$iTime}) {
+            print " - " . $hURLByTime{$iTime};
+        }
+        print "\n";
+        last if ++$iIndex > 9;
+    }
+}
+
+if ($#aTimeBlockKeys >= 0) {
+    print "\nBy $iWindowMinutes-Minute Time Window:\n";
+    my $iKeyIndex = 0;
+    foreach my $iTimestamp (@aTimeBlockKeys) {
+        print $hRequestsInTimeBlock{$iTimestamp} . prct($hRequestsInTimeBlock{$iTimestamp}) . "\t" . localtime($iTimestamp);
+        print(($#aCacheVerbKeys >= 0 ? ' [' . int($hHitsInTimeBlock{$iTimestamp} / $hRequestsInTimeBlock{$iTimestamp} * 100) . '% HIT]' : '') . "\n");
+        last if ++$iKeyIndex > 9;
+    }
+
+    my $iMaxTraffic = $hRequestsInTimeBlock{ $aTimeBlockKeys[0] };
+
+    print "\nTraffic Distribution\n";
+    foreach my $iTimestamp (sort keys %hRequestsInTimeBlock) {
+        my $iAmount = $hRequestsInTimeBlock{$iTimestamp} / $iMaxTraffic * 100;
+        print localtime($iTimestamp) . ($iRegex > 0 && $iRegex < 3 ? ' [' . int($hHitsInTimeBlock{$iTimestamp} / $hRequestsInTimeBlock{$iTimestamp} * 100) . "% HIT]\t" : "\t") . ("*" x $iAmount) . "\n";
+    }
+}
+

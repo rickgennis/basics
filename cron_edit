@@ -1,0 +1,83 @@
+#!/usr/bin/perl -w
+
+# 8/16/2016 RGE
+
+use Getopt::Long;
+use strict;
+
+use constant CRONTAB => '/usr/bin/crontab';
+
+my $bEnable = 0;
+my $bDisable = 0;
+my $sUser = '';
+
+
+# read user config from the commandline
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+GetOptions('enable' => \$bEnable, 'disable' => \$bDisable, 'user=s' => \$sUser);
+my $sCommand = shift || '';
+my $sSpecifyUser = $sUser ? "-u $sUser" : '';
+
+if ($bEnable && $bDisable) {
+	print "--enable and --disable are mutually exclusive\n";
+	exit;
+}
+
+unless (($bEnable || $bDisable) && $sCommand) {
+	print "$0 [--enable | --disable] [--user USER] command\n";
+	print "Enable/disable a command in the specified user's crontab.\n";
+	print "The 'command' is matched against the 6th field in the crontab entry.\n";
+	print "cronedit will only comment or uncomment an existing command, not add from scratch.\n";
+	exit;
+}
+
+
+# read the crontab into memory
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+open(CT_IN, CRONTAB . " $sSpecifyUser -l |") || die("Unable to execute " . CRONTAB);
+my @aCrontab = <CT_IN>;
+close(CT_IN);
+
+my $iLine = -1;
+
+
+# update the crontab in memory
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+while (my $sLine = $aCrontab[++$iLine]) {
+	my $bCurrentlyDisabled = 0;
+
+	if ($sLine =~ /^(\s*\#+\s*)(.*)/) {
+		$bCurrentlyDisabled = 1;
+		$sLine = $2;
+	}
+
+	my @aFields = split(/\s+/, $sLine);
+	if (defined $aFields[5]) {
+		if ($aFields[5] =~ /$sCommand/) {
+			my $bPreviouslyTagged = ($#aCrontab > $iLine && $aCrontab[$iLine + 1] =~ /abled by cronedit on/) ? 1 : 0;
+
+			if ($bEnable && $bCurrentlyDisabled) {
+				print "enabled $sCommand\n";	
+				$aCrontab[$iLine] = "$sLine\n";
+				splice(@aCrontab, $iLine + 1, $bPreviouslyTagged, "# above enabled by cronedit on " . localtime(time()) . "\n");
+			}
+			elsif ($bDisable && !$bCurrentlyDisabled) {
+				print "disabled $sCommand\n";
+				$aCrontab[$iLine] = '#' . $sLine;
+				splice(@aCrontab, $iLine + 1, $bPreviouslyTagged, "# above disabled by cronedit on " . localtime(time()) . "\n");
+			}
+		}
+	} 
+}
+
+
+# save new crontab back to the daemon
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+open(CT_OUT, '| ' . CRONTAB . " $sSpecifyUser -") || die("Unable to execute " . CRONTAB);
+print CT_OUT @aCrontab;
+close(CT_OUT);
+

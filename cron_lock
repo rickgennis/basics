@@ -1,0 +1,358 @@
+#!/usr/bin/perl -w
+
+# {ansible managed - do not edit}
+# 
+# cron_lock
+# 11/19/14 RGE
+
+use strict;
+use Getopt::Long;
+use IO::Select;
+use Sys::Syslog qw(:standard :macros);
+use POSIX ":sys_wait_h";
+use constant ONEWEEK => 604800;
+
+my $DEBUG          = 0;
+my $sLockFilename;
+my $sLockName      = '';
+my $iMyStartTime   = time();
+my $iChildPID      = 0;
+my $bKillOnTimeout = 0;
+my %hProcessPPID;
+my @aKillPids;
+
+# configure signal handlers
+my $tSignalSet         = POSIX::SigSet->new();
+my $tSignalActionTerm  = POSIX::SigAction->new("sigHandlerTerm", $tSignalSet, &POSIX::SA_NODEFER);
+my $tSignalActionChild = POSIX::SigAction->new("sigHandlerChild", $tSignalSet, &POSIX::SA_NODEFER);
+
+# install signal handlers
+POSIX::sigaction(&POSIX::SIGTERM, $tSignalActionTerm);
+POSIX::sigaction(&POSIX::SIGINT,  $tSignalActionTerm);
+POSIX::sigaction(&POSIX::SIGCHLD, $tSignalActionChild);
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# load 'ps' data into memory to map pid to ppid
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub loadProcTree() {
+    if (opendir(my $PS, "/proc")) {
+        my @aProcs = grep { /^\d+$/ } readdir($PS);
+        closedir($PS);
+
+        %hProcessPPID = map { $_ => getPPIDof($_) } @aProcs;
+        return 1;
+    }
+
+    return 0;
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# determine the ppid of a given pid
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub getPPIDof($) {
+    my $iPid = shift;
+
+    if (open(P, "/proc/$iPid/stat")) {
+        my $sData = <P>;
+        my @aField = split(/\s+/, $sData);
+        close(P);
+        return $aField[3] if ($aField[3] =~ /^\d+$/);
+    }
+
+    return 0;
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# add all child pids of a given pid to the kill list
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub markKidsOf($);
+
+sub markKidsOf($) {
+    my $iTargetPid = shift;
+
+    foreach my $iPid (sort { $a <=> $b } keys %hProcessPPID) {
+        if ($hProcessPPID{$iPid} == $iTargetPid) {
+            push(@aKillPids, $iPid);
+            markKidsOf($iPid);
+        }
+    }
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# kill all child procs of a pid.
+# if we're able to read the process table then kill
+# grandchild procs and everything further down too
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub killChildProcs() {
+    if (loadProcTree()) {
+        markKidsOf($iChildPID);
+
+        foreach (@aKillPids) {
+            kill('TERM', $_) if ($_ > 1);
+        }
+    }
+
+    kill('TERM', $iChildPID) if ($iChildPID > 1);
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# kill procs on SIGTERM is given -k
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub sigHandlerTerm() {
+    $DEBUG && print STDERR "caught SIGTERM\n";
+
+    killChildProcs() if $bKillOnTimeout;
+    $iChildPID = -1;
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# reap children on SIGCHLD
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub sigHandlerChild() {
+    $DEBUG && print STDERR "caught SIGCHLD\n";
+
+    while ((my $iPID = waitpid(-1, WNOHANG)) > 0) {
+        if ($iPID == $iChildPID) {
+            $iChildPID = 0;
+        }
+    }
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# convert seconds to printable English
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub prettyDuration($) {
+    my $iInitialSeconds = shift;
+
+    my %hConversion = (
+        31557600 => 'year',
+        2419200  => 'month',
+        604800   => 'week',
+        86400    => 'day',
+        3600     => 'hour',
+        60       => 'minute',
+        1        => 'second'
+    );
+
+    my $sResult       = '';
+    my $iWorkingValue = $iInitialSeconds;
+    foreach my $iDiv (reverse sort { $a <=> $b } keys %hConversion) {
+        my $iValue = int($iWorkingValue / $iDiv);
+        if ($iValue >= 1) {
+            $iWorkingValue = $iWorkingValue % $iDiv;
+            $sResult .= ($sResult ? ', ' : '') . $iValue . ' ' . $hConversion{$iDiv} . ($iValue == 1 ? '' : 's');
+        }
+    }
+
+    return $sResult ? $sResult : 'no time';
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# read the lock state file
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub readLockFile($) {
+    my $sLockFile = shift;
+    my %hPidStarts;
+
+    if (-f $sLockFile && (my $iMtime = (stat($sLockFile))[9])) {
+
+        if (open(F, $sLockFile)) {
+            while (<F>) {
+                my ($iPid, $iStartTime);
+                if (/^(\d+),(\d+)/) {
+                    $iPid       = $1;
+                    $iStartTime = $2;
+                }
+                elsif (/^(\d+)/) {
+                    $iPid       = $1;
+                    $iStartTime = $iMtime;
+                }
+                else {
+                    $iPid       = 0;
+                    $iStartTime = $iMtime;
+                }
+                $hPidStarts{ $iPid ? $iPid : 'not_specified' } = $iStartTime;
+            }
+            close(F);
+
+            # when the lockfile exists but has no contents it was created with an older version
+            # of cron_lock.  let's create a basic lock (no pid) for backwards compatibility.
+            $hPidStarts{not_specified} = $iMtime unless (keys(%hPidStarts));
+        }
+    }
+    return %hPidStarts;
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# write the lock state file
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub writeLockFile($) {
+    my $rPidStarts = shift;
+    my %hPidStarts = %{$rPidStarts};
+
+    if (keys(%hPidStarts)) {
+
+        unless (open(F, ">$sLockFilename")) {
+            syslog(LOG_INFO, "ERROR: lock=$sLockName, unable to acquire lock - can't write $sLockFilename");
+            die "unable to create lockfile $sLockFilename";
+        }
+
+        foreach my $iPid (keys %hPidStarts) {
+            print F $iPid . ',' . $hPidStarts{$iPid} . "\n";
+        }
+        close(F);
+    }
+    else {
+        unlink($sLockFilename);
+    }
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# fork & exec, return in the parent
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub forkExecChild(@) {
+    my @aCmd = @_;
+
+    if (my $iPid = fork()) {
+        return $iPid;
+    }
+
+    exec(@aCmd);
+    exit(0);    # never get here
+}
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# expire locks that are stale or the process has vanished
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+sub expireStaleLocks($$) {
+    my $rLockRef = shift;
+    my $iTimeout = shift;
+    my %hLocks = %{$rLockRef};
+
+    foreach my $iPid (keys %hLocks) {
+        my $iStartTime = $hLocks{$iPid};
+        if (!$iPid || ($iPid eq 'not_specified') || (-d "/proc/$iPid")) {
+            if ($iTimeout && ($iMyStartTime - $iStartTime >= $iTimeout)) {
+                syslog(LOG_INFO, "WARNING: lock=$sLockName, pid=" . ($iPid ? $iPid : '?') . " (" . localtime($iStartTime) . ") is stale; releasing lock");
+                delete $rLockRef->{$iPid};
+            }
+        }
+        else {
+            syslog(LOG_INFO, "WARNING: lock=$sLockName, pid=$iPid (" . localtime($iStartTime) . ") PID has vanished; releasing lock");
+            delete $rLockRef->{$iPid};
+        }
+    }
+}
+
+
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+# MAIN
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+my $iTimeout       = 5400;
+my $iMaxConcurrent = 1;
+my $bShowLocks     = 0;
+GetOptions('l=s' => \$sLockName, 's' => \$bShowLocks, 't=i' => \$iTimeout, 'c=i' => \$iMaxConcurrent, 'k' => \$bKillOnTimeout);
+
+# verify parameters
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+
+if ($bShowLocks) {
+    if (opendir(my $DIR, "/tmp")) {
+        my @aLockFiles = grep { /^\.cron_lock\./ && -f "/tmp/$_" } readdir($DIR);
+        closedir($DIR);
+
+        foreach my $sLock (sort @aLockFiles) {
+            my $sName = substr($sLock, 11, length($sLock) - 11);
+            my %hLocks = readLockFile("/tmp/$sLock");
+            expireStaleLocks(\%hLocks, 0);
+
+            my $sDetail = '';
+            foreach my $iPid (keys %hLocks) {
+                $sDetail = ($sDetail ? "$sDetail" : '') . "\tpid " . $iPid . ' for ' . prettyDuration($iMyStartTime - $hLocks{$iPid}) . "\n";
+            }
+
+            if (keys %hLocks) {
+                print "$sName: " . (keys %hLocks) . " lock" . (keys %hLocks > 1 ? 's' : '') . "\n";
+                print "$sDetail";
+            }
+        }
+    }
+
+    exit;
+}
+
+unless ($sLockName && $ARGV[0]) {
+    print "$0 -l lockName [-t timeoutSecs] [-c maxConcurrent] [-k] command\n";
+    print "\t-l unique name of the lock\n";
+    print "\t-t timeout in seconds; default: $iTimeout (" . prettyDuration($iTimeout) . "), 0=infinite\n";
+    print "\t-c maximum number of concurrent holders of this lock name; default: 1\n";
+    print "\t-k kill the child process on timeout - otherwise only the lock is released\n";
+    print "\t-s show master list of current locks\n";
+    exit(0);
+}
+
+# open log file & setup vars
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+openlog('cron_lock', 'pid', 'local0');
+$sLockName =~ tr/\/ /_/;
+$sLockFilename = "/tmp/.cron_lock.$sLockName";
+
+# check existing lock(s) for validity
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+my %hPreLocks = readLockFile($sLockFilename);
+expireStaleLocks(\%hPreLocks, $iTimeout);
+
+# see if the new lock can be acquired
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+unless (keys(%hPreLocks) < $iMaxConcurrent) {
+    my $sDetail = '';
+    foreach my $iPid (keys %hPreLocks) {
+        $sDetail = ($sDetail ? "$sDetail; " : '') . 'pid ' . $iPid . ' for ' . prettyDuration($iMyStartTime - $hPreLocks{$iPid});
+    }
+    syslog(LOG_INFO, "DENIED: lock=$sLockName, max locks already held ($sDetail)");
+    exit(1);
+}
+
+# create lock
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+$hPreLocks{$$} = $iMyStartTime;
+writeLockFile(\%hPreLocks);
+my $iLocks = keys(%hPreLocks);
+syslog(LOG_INFO, "ACQUIRED: lock=$sLockName, now $iLocks lock" . ($iLocks == 1 ? '' : 's') . " held (timeout=$iTimeout)");
+
+# run command
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+$iChildPID = forkExecChild(@ARGV);
+
+# wait for it
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+while ($iChildPID > 0) {
+    $DEBUG && print STDERR "iChildPID = $iChildPID\n";
+
+    sleep($iTimeout ? $iTimeout : 86400);
+    #sleep(5);
+    last if ($iTimeout && (time() - $iMyStartTime >= $iTimeout));
+
+    # processing passes to one of the signal handlers on SIGCHLD, SIGTERM or SIGINT
+}
+
+# remove lock
+#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#
+my %hPostLocks = readLockFile($sLockFilename);
+delete $hPostLocks{$$};
+writeLockFile(\%hPostLocks);
+
+my $sTimeText = prettyDuration(time() - $iMyStartTime);
+my $iLeft     = keys(%hPostLocks);
+
+if (($iChildPID > 0) && -d "/proc/$iChildPID") {
+    syslog(LOG_INFO, "TIMEDOUT: lock=$sLockName (held for $sTimeText)" . ($bKillOnTimeout ? ' KILLED' : '') . ", $iLeft lock" . ($iLeft == 1 ? '' : 's') . " remaining");
+    killChildProcs() if $bKillOnTimeout;
+}
+elsif (!$iChildPID) {
+    syslog(LOG_INFO, "RELEASED: lock=$sLockName (held for $sTimeText), $iLeft lock" . ($iLeft == 1 ? '' : 's') . " remaining");
+}
+else {
+    syslog(LOG_INFO, "KILLED: lock=$sLockName (held for $sTimeText), $iLeft lock" . ($iLeft == 1 ? '' : 's') . " remaining");
+}

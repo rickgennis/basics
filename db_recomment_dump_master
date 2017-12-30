@@ -1,0 +1,95 @@
+#!/usr/bin/perl -w
+
+# { managed by ansible - do not edit }
+#
+# Given a dump file or input stream with two CHANGE MASTER lines, one of which is
+# commented out, swap the comment to the other one.  You can either pipe the dump
+# file into this script or provide the filename as a command line parameter.
+#
+# If you provide the filename (which requires the file to be uncompressed) we do
+# a binary edit that's instant, regardless of the size of the file.  If you pipe
+# it in then we have to process the entire thing.  That'll take some time.
+
+
+use strict;
+
+if (-t STDIN) {
+	# we have no STDIN - so we can do the fast, binary version
+
+	if (!@ARGV) {
+		print "$0 [dump_filename]\n";
+		print "  Toggle the comment between the two change master lines in a dump file.\n";
+		exit(0);
+	}
+
+	if ($ARGV[0] =~ /\.gz$/i) {
+		print "Cannot perform direct binary access of a compressed file.\n";
+		exit(1);
+	}
+
+
+	if (open(DF, $ARGV[0])) {
+		my $iCurPosition = 0;
+		my $iFirstPosition = 0;
+		my $iSecondPosition = 0;
+		my $iFoundLines = 0;
+		my $bFirstLineWasCommented = 0;
+
+		while (<DF>) {
+			if (/CHANGE MASTER TO MASTER_HOST/) {
+				++$iFoundLines;
+	
+				if ($iFoundLines == 1) {
+					$iFirstPosition = $iCurPosition;
+					$bFirstLineWasCommented = (/^#/) ? 1 : 0;
+				}
+				elsif ($iFoundLines == 2) {
+					$iSecondPosition = $iCurPosition;
+					last;
+				}
+
+			}
+
+			$iCurPosition = tell(DF);
+		}
+
+		close(DF);
+
+		if ($iFoundLines == 2) {
+			open(DF, '+<' . $ARGV[0]);
+			seek(DF, $iFirstPosition, 0);
+			print DF ($bFirstLineWasCommented ? ' ' : '#');
+
+			seek(DF, $iSecondPosition, 0);
+			print DF ($bFirstLineWasCommented ? '#' : ' ');
+			close(DF);
+
+			print "Successfully swapped comments.\n";
+		}
+	}
+	else {
+		print "Unable to open " . $ARGV[0] . ".\n";
+	}
+}
+else {
+	# we've got STDIN - we have to process the data stream line by line (ugh)
+	# at this point we're essentially sed
+
+	while (<>) {
+		if (/^\s*(#)*\s*CHANGE MASTER TO MASTER_HOST/) {
+			if (/^\s*#(.*)/s) {
+				print ' ' . $1;
+			}
+			elsif (/^\s(\s*CHANGE MASTER TO.*)/s) {
+				print '#' . $1;
+			}
+			elsif (/^(\s*CHANGE MASTER TO.*)/s) {
+				print '#' . $1;
+			}
+		}
+		else {
+			print $_;
+		}
+	}
+}
+
