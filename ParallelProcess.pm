@@ -13,13 +13,10 @@ package ParallelProcess;
 # to 10.
 # 	parallelProcess(10);
 #
-# By default logging goes to both STDOUT and syslog.
-# Set $LogTo if you want output to a file instead.
+# Logging goes to both STDOUT and syslog.
 #
 # Additionally, the 'SummaryAtTop' directive can be used to alter the
-# logging order.  It applies to STDOUT or a file logging (specified via
-# $LogTo).  syslog maintains its own timestamps and so ignores the
-# SummaryAtTop option.
+# logging order.  It applies to STDOUT.
 #
 #	parallelProcess(10, SummaryAtTop);
 #
@@ -28,14 +25,15 @@ package ParallelProcess;
 use Time::HiRes;
 use Sys::Syslog qw(:standard :macros);
 use base 'Exporter';
-our @EXPORT = ('$LogTo', 'parallelProcess', 'addJob', 'PendingPreviousJob', 'SummaryAtTop');
+our @EXPORT = ('parallelProcess', 'addJob', 'PendingPreviousJob', 'SummaryAtTop');
 use constant PendingPreviousJob => -1;
 use constant SummaryAtTop => -1;
+use constant FinalMessage => 1;
 
 use warnings;
 use strict;
-our $LogTo = 'STDOUT';
 
+my $sTempLogName = "/tmp/.pp.log.$$";
 my %hJobs;
 my %hChildProcs;
 my %hErrors;
@@ -72,37 +70,23 @@ sub prettyDuration($;$) {
 }
 
 
-sub lowlevel_log($) {
-	my $sMsg = shift;
-
-	if ($LogTo ne 'STDOUT') {
-		open(LOG, ">$LogTo") || die 'failure';
-		print LOG localtime(time) . " $sMsg\n";
-		close(LOG);
-	}
-	else {
-		print localtime(time) . " $sMsg\n";
-		syslog(LOG_NOTICE, $sMsg);
-	}
-}
-
-
 sub logMsg($;$) {
 	my $sMsg = shift;
 	my $bFinalMsg = shift || 0;
 
+	syslog(LOG_NOTICE, $sMsg);
+
 	if ($bFinalMsg) {
-		if ($LogTo eq 'STDOUT') {       # special case to bypass timestamps on stdout
-			print $sMsg;
-			syslog(LOG_NOTICE, $sMsg);
-			foreach my $sSavedMsg (@aLogMessages) {
-				print $sSavedMsg;
-			}
-		}
-		else {
-			lowlevel_log($sMsg);
-			foreach my $sSavedMsg (@aLogMessages) {
-				lowlevel_log($sSavedMsg);
+		print "$sMsg\n";
+		
+		if ($g_bSummaryAtTop && open(LOG, $sTempLogName)) {
+			local $/;
+			my @aData = <LOG>;
+			close(LOG);
+			unlink($sTempLogName);
+
+			foreach (@aData) {
+				print;
 			}
 		}
 
@@ -110,15 +94,13 @@ sub logMsg($;$) {
 	}
 
 	if ($g_bSummaryAtTop) {
-		push(@aLogMessages, localtime(time) . " $sMsg\n");
-
-		if ($LogTo eq 'STDOUT') {
-			syslog(LOG_NOTICE, $sMsg);
+		if (open(LOG, ">>", $sTempLogName)) {
+			print LOG localtime(time) . " $sMsg\n";
+			close(LOG);
 		}
-
 	}
 	else {
-		lowlevel_log($sMsg);
+		print localtime(time) . " $sMsg\n";
 	}
 }
 
@@ -136,19 +118,23 @@ sub forkChild($) {
 	# in the child
 	else {
 		logMsg($hJobs{$iJobId}->{'name'} . " starting as pid $$");
-		my $iResult = system($hJobs{$iJobId}->{'command'});
+		my $iReturnCode = 0;
+		my $iResult = system($hJobs{$iJobId}->{'command'} . ($g_bSummaryAtTop ? " 2> /tmp/.pp.$$.$iJobId" : ''));
 		if ($iResult == -1) {
-			logMsg($hJobs{$iJobId}->{'name'} . " ERROR launching [" . $hJobs{$iJobId}->{'name'} . "]");
-			exit(127);
+			logMsg($hJobs{$iJobId}->{'name'} . " ERROR launching [" . $hJobs{$iJobId}->{'command'} . "]");
+			$iReturnCode = 127;
 		}
 		else {
-			my $iReturnCode = $iResult >> 8;
-			if ($iReturnCode != 0) {
+			$iReturnCode = $iResult >> 8;
+			if ($iReturnCode == 127) {
+				logMsg($hJobs{$iJobId}->{'name'} ." ERROR launching [" . $hJobs{$iJobId}->{'command'} . "]");
+			}
+			elsif ($iReturnCode != 0) {
 				logMsg($hJobs{$iJobId}->{'name'} ." ERROR; return code $iReturnCode from [" . $hJobs{$iJobId}->{'command'} . "]");
-				exit($iReturnCode);
 			}
 		}
-		exit(0);
+
+		exit($iReturnCode);
 	}
 }
 
@@ -238,7 +224,7 @@ sub parallelProcess(;$$) {
 
 	# wait for a running job to finish
 	while (keys %hChildProcs) {
-    		my $iKid = waitpid(-1, 0);
+    	my $iKid = waitpid(-1, 0);
 		my ($iRC, $iSig, $bCore) = ($? >> 8, $? & 127, $? & 128);
 		my $iEndTime = Time::HiRes::time();
 
@@ -253,6 +239,22 @@ sub parallelProcess(;$$) {
 
 		delete($hChildProcs{$iKid});
 		$hJobs{$iJobId}->{'state'} = 'completed';
+
+		my $sStdErrFile = "/tmp/.pp.$iKid.$iJobId";
+		if (-e "$sStdErrFile") {
+			if (open(my $FH, "<", $sStdErrFile)) {
+				my $sErrors;
+				{
+					local $/;
+					$sErrors = <$FH>;
+				}
+				close($FH);
+				chomp($sErrors);
+
+				logMsg($hJobs{$iJobId}->{'name'} . ": $sErrors") if ($sErrors);
+			}
+			unlink($sStdErrFile);
+		}
 
 		if ($iRC == 0) {
 			$hJobs{$iJobId}->{'elapsed'} = $iElapsed;
@@ -286,7 +288,7 @@ sub parallelProcess(;$$) {
 				$sErrs .= "     " . $hJobs{$iJobId}->{'name'} . ($hErrors{$iJobId} == 127 ? ' failed to execute' : ' returned exit code ' . $hErrors{$iJobId}) . "\n";
 			}
 		}
-		logMsg($sSummary1 . "\n" . $sSummary2 . "\n" . $sErrs . "\n", 1);
+		logMsg($sSummary1 . "\n" . $sSummary2 . "\n" . $sErrs, FinalMessage);
 	}
 	else {
 		logMsg($sSummary1);
